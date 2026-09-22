@@ -267,4 +267,21 @@ class PMPro_Brevo_API {
 		$contact_data['updateEnabled'] = true;
 		return $this->request( '/contacts', 'POST', $contact_data );
 	}
+
+	/**
+	 * Update an existing contact by its Brevo contact ID.
+	 *
+	 * Used instead of the email upsert when we already know the contact,
+	 * so an email address change updates the contact rather than creating a new one.
+	 * A new email is passed as the EMAIL attribute. Returns 204 with no body on success.
+	 *
+	 * @since TBD
+	 *
+	 * @param int   $contact_id   Brevo contact ID.
+	 * @param array $contact_data Contact data (attributes, listIds, unlinkListIds, emailBlacklisted).
+	 * @return array|WP_Error Response data.
+	 */
+	public function update_contact( $contact_id, $contact_data ) {
+		return $this->request( '/contacts/' . intval( $contact_id ), 'PUT', $contact_data, array( 'identifierType' => 'contact_id' ) );
+	}
 }

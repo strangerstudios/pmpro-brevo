@@ -169,48 +169,11 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 	$log .= "Contact data: " . print_r( $contact_data, true ) . ". "; // phpcs:ignore WordPress.PHP.DevelopmentFunctions
 
 	// ------------------------------------------------------------------
-	// Upsert the contact.
-	// POST /contacts with updateEnabled is non-destructive — listIds here are ADDED, not replaced.
+	// Work out which controlled lists the user should be removed from.
+	// The upsert/update only adds lists — it does not remove.
 	// ------------------------------------------------------------------
-	$result = $api->upsert_contact( $contact_data );
-
-	if ( is_wp_error( $result ) ) {
-		$log .= "Error upserting contact: " . $result->get_error_message() . ". ";
-		pmprobrevo_debug_log( $log );
-		return;
-	}
-
-	// 201 returns the new ID. 204 (updated existing contact) returns nothing, so look the contact up.
-	$email_blacklisted = null;
-	if ( ! empty( $result['id'] ) ) {
-		$contact_id = (int) $result['id'];
-		$log .= "Created contact ID {$contact_id}. ";
-	} else {
-		$contact = $api->get_contact( $contact_data['email'] );
-		if ( is_wp_error( $contact ) ) {
-			$log .= "Updated existing contact but could not retrieve it: " . $contact->get_error_message() . ". ";
-		} else {
-			$contact_id        = ! empty( $contact['id'] ) ? (int) $contact['id'] : $contact_id;
-			$email_blacklisted = ! empty( $contact['emailBlacklisted'] );
-			$log .= "Updated contact ID {$contact_id} (emailBlacklisted: " . ( $email_blacklisted ? 'true' : 'false' ) . "). ";
-		}
-	}
-
-	if ( $contact_id ) {
-		update_user_meta( $user_id, 'pmprobrevo_contact_id', $contact_id );
-	}
-
-	// Log a warning for contacts that have unsubscribed from email.
-	if ( true === $email_blacklisted ) {
-		$log .= "WARNING: Contact {$contact_id} is blacklisted for email in Brevo (unsubscribed). They are in their lists but will not receive campaigns unless the Contact Status setting is set to Always set to Active. ";
-	}
-
-	// ------------------------------------------------------------------
-	// Handle list removal for levels the user no longer holds.
-	// The upsert only adds lists — it does not remove.
-	// We explicitly remove lists the user should no longer be in.
-	// ------------------------------------------------------------------
-	$unsubscribe = isset( $options['unsubscribe'] ) ? $options['unsubscribe'] : 'yes';
+	$lists_to_remove = array();
+	$unsubscribe     = isset( $options['unsubscribe'] ) ? $options['unsubscribe'] : 'yes';
 	if ( $update_lists && 'yes' === $unsubscribe ) {
 		$controlled_list_ids = pmprobrevo_get_controlled_list_ids();
 
@@ -226,9 +189,71 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 		 */
 		$controlled_list_ids = apply_filters( 'pmprobrevo_controlled_list_ids', $controlled_list_ids );
 
-		$lists_to_remove = array_diff( $controlled_list_ids, $subscribe_lists );
+		$lists_to_remove = array_values( array_diff( $controlled_list_ids, $subscribe_lists ) );
 		$log .= "Lists to remove: " . ( ! empty( $lists_to_remove ) ? implode( ', ', $lists_to_remove ) : 'none' ) . ". ";
+	} elseif ( 'no' === $unsubscribe ) {
+		$log .= "List removal is disabled. ";
+	}
 
+	// ------------------------------------------------------------------
+	// Update by stored contact ID when we have one.
+	// PUT /contacts/{id} handles an email address change on the existing contact
+	// and removes lists via unlinkListIds in the same call.
+	// ------------------------------------------------------------------
+	$updated_by_id = false;
+	if ( ! empty( $contact_id ) ) {
+		$update_data = $contact_data;
+		unset( $update_data['email'] );
+		$update_data['attributes']['EMAIL'] = $contact_data['email'];
+		if ( ! empty( $lists_to_remove ) ) {
+			$update_data['unlinkListIds'] = $lists_to_remove;
+		}
+
+		$result = $api->update_contact( $contact_id, $update_data );
+		if ( is_wp_error( $result ) ) {
+			// Contact was deleted or merged in Brevo. Fall back to the email upsert below.
+			$log .= "Could not update contact ID {$contact_id}: " . $result->get_error_message() . ". Falling back to upsert by email. ";
+			delete_user_meta( $user_id, 'pmprobrevo_contact_id' );
+			$contact_id = 0;
+		} else {
+			$updated_by_id = true;
+			$log .= "Updated contact ID {$contact_id} by ID. ";
+			if ( ! empty( $lists_to_remove ) ) {
+				$log .= "Removed list IDs: " . implode( ', ', $lists_to_remove ) . ". ";
+			}
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// Otherwise upsert by email.
+	// POST /contacts with updateEnabled is non-destructive — listIds here are ADDED, not replaced.
+	// ------------------------------------------------------------------
+	$email_blacklisted = null;
+	if ( ! $updated_by_id ) {
+		$result = $api->upsert_contact( $contact_data );
+
+		if ( is_wp_error( $result ) ) {
+			$log .= "Error upserting contact: " . $result->get_error_message() . ". ";
+			pmprobrevo_debug_log( $log );
+			return;
+		}
+
+		// 201 returns the new ID. 204 (updated existing contact) returns nothing, so look the contact up.
+		if ( ! empty( $result['id'] ) ) {
+			$contact_id = (int) $result['id'];
+			$log .= "Created contact ID {$contact_id}. ";
+		} else {
+			$contact = $api->get_contact( $contact_data['email'] );
+			if ( is_wp_error( $contact ) ) {
+				$log .= "Updated existing contact but could not retrieve it: " . $contact->get_error_message() . ". ";
+			} else {
+				$contact_id        = ! empty( $contact['id'] ) ? (int) $contact['id'] : 0;
+				$email_blacklisted = ! empty( $contact['emailBlacklisted'] );
+				$log .= "Updated contact ID {$contact_id} (emailBlacklisted: " . ( $email_blacklisted ? 'true' : 'false' ) . "). ";
+			}
+		}
+
+		// Remove lists one call at a time, by email.
 		foreach ( $lists_to_remove as $list_id ) {
 			$response = $api->remove_contact_from_list( $contact_data['email'], $list_id );
 			if ( is_wp_error( $response ) ) {
@@ -240,8 +265,15 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 				$log .= "Removed list ID {$list_id}. ";
 			}
 		}
-	} elseif ( 'no' === $unsubscribe ) {
-		$log .= "List removal is disabled. ";
+	}
+
+	if ( $contact_id ) {
+		update_user_meta( $user_id, 'pmprobrevo_contact_id', $contact_id );
+	}
+
+	// Log a warning for contacts that have unsubscribed from email.
+	if ( true === $email_blacklisted ) {
+		$log .= "WARNING: Contact {$contact_id} is blacklisted for email in Brevo (unsubscribed). They are in their lists but will not receive campaigns unless the Contact Status setting is set to Always set to Active. ";
 	}
 
 	pmprobrevo_debug_log( $log );
@@ -340,12 +372,12 @@ function pmprobrevo_sync_user_on_edit_member_user_fields_save() {
 		return;
 	}
 
-	$panel_slug = empty( $_REQUEST['pmpro_member_edit_panel'] ) ? '' : sanitize_text_field( $_REQUEST['pmpro_member_edit_panel'] );
+	$panel_slug = empty( $_REQUEST['pmpro_member_edit_panel'] ) ? '' : sanitize_text_field( wp_unslash( $_REQUEST['pmpro_member_edit_panel'] ) );
 	if ( empty( $panel_slug ) || strpos( $panel_slug, 'user-fields-' ) !== 0 ) {
 		return;
 	}
 
-	if ( empty( $_REQUEST['pmpro_member_edit_saved_panel_nonce'] ) || ! wp_verify_nonce( $_REQUEST['pmpro_member_edit_saved_panel_nonce'], 'pmpro_member_edit_saved_panel_' . $panel_slug ) ) {
+	if ( empty( $_REQUEST['pmpro_member_edit_saved_panel_nonce'] ) || ! wp_verify_nonce( sanitize_key( wp_unslash( $_REQUEST['pmpro_member_edit_saved_panel_nonce'] ) ), 'pmpro_member_edit_saved_panel_' . $panel_slug ) ) {
 		return;
 	}
 
