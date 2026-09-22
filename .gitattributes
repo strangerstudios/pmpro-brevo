@@ -1,0 +1,7 @@
+# Items to ignore when downloading a zip
+.gitattributes export-ignore
+.github export-ignore
+.gitignore export-ignore
+README.md export-ignore
+package.json export-ignore
+pmpro-brevo-banner.png export-ignore
