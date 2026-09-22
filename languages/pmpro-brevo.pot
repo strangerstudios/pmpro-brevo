@@ -1,0 +1,230 @@
+# Copyright (C) 2026 Paid Memberships Pro
+# This file is distributed under the GPL-3.0+.
+msgid ""
+msgstr ""
+"Project-Id-Version: Paid Memberships Pro - Brevo Add On 1.0\n"
+"Report-Msgid-Bugs-To: info@paidmembershipspro.com\n"
+"Last-Translator: Paid Memberships Pro <info@paidmembershipspro.com>\n"
+"Language-Team: Paid Memberships Pro <info@paidmembershipspro.com>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"POT-Creation-Date: 2026-09-22T23:56:59+00:00\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"X-Generator: WP-CLI 2.9.0\n"
+"X-Domain: pmpro-brevo\n"
+
+#. Plugin Name of the plugin
+msgid "Paid Memberships Pro - Brevo Add On"
+msgstr ""
+
+#. Plugin URI of the plugin
+msgid "https://www.paidmembershipspro.com/add-ons/brevo-integration/"
+msgstr ""
+
+#. Description of the plugin
+msgid "Connect Paid Memberships Pro to Brevo to add members as contacts and manage lists automatically."
+msgstr ""
+
+#. Author of the plugin
+msgid "Paid Memberships Pro"
+msgstr ""
+
+#. Author URI of the plugin
+msgid "https://www.paidmembershipspro.com"
+msgstr ""
+
+#: classes/class-pmpro-brevo-api.php:99
+msgid "Brevo API key not configured."
+msgstr ""
+
+#: classes/class-pmpro-brevo-api.php:140
+msgid "Brevo API rate limit reached. Please try again later."
+msgstr ""
+
+#: includes/admin.php:18
+#: includes/admin.php:19
+msgid "Brevo"
+msgstr ""
+
+#: includes/admin.php:77
+msgid "Settings saved."
+msgstr ""
+
+#: includes/admin.php:84
+msgid "Brevo Settings"
+msgstr ""
+
+#: includes/admin.php:87
+msgid "Paid Memberships Pro - Brevo Add On Documentation"
+msgstr ""
+
+#: includes/admin.php:87
+msgid "Brevo Add On documentation"
+msgstr ""
+
+#. translators: %s: Link to Brevo Add On documentation.
+#: includes/admin.php:89
+msgid "Learn more about these settings in the %s."
+msgstr ""
+
+#: includes/admin.php:98
+msgid "General Settings"
+msgstr ""
+
+#: includes/admin.php:105
+msgid "API Key"
+msgstr ""
+
+#: includes/admin.php:110
+msgid "Your API key is used to connect your Brevo account to this membership site."
+msgstr ""
+
+#: includes/admin.php:111
+msgid "Find your API key in Brevo under SMTP & API > API Keys."
+msgstr ""
+
+#: includes/admin.php:116
+msgid "Sync on Profile Update"
+msgstr ""
+
+#: includes/admin.php:122
+msgid "Yes, sync contact data and lists"
+msgstr ""
+
+#: includes/admin.php:123
+msgid "Yes, sync contact data only"
+msgstr ""
+
+#: includes/admin.php:124
+msgid "No, do not sync anything on profile update"
+msgstr ""
+
+#: includes/admin.php:126
+msgid "Choose what to sync to Brevo when a user profile is updated in WordPress."
+msgstr ""
+
+#: includes/admin.php:130
+msgid "Remove Lists When Membership Changes"
+msgstr ""
+
+#: includes/admin.php:136
+msgid "Yes, remove from lists that no longer apply"
+msgstr ""
+
+#: includes/admin.php:137
+msgid "No, never remove from lists"
+msgstr ""
+
+#: includes/admin.php:139
+msgid "When enabled, the integration will remove the contact from Brevo lists when they no longer match the current membership. Only lists assigned to a membership level below are ever removed."
+msgstr ""
+
+#: includes/admin.php:143
+msgid "Contact Status"
+msgstr ""
+
+#: includes/admin.php:149
+msgid "Respect existing status (leave unsubscribed contacts unsubscribed)"
+msgstr ""
+
+#: includes/admin.php:150
+msgid "Always set to Active (re-enable email for unsubscribed contacts)"
+msgstr ""
+
+#: includes/admin.php:152
+msgid "Controls what happens when a member has previously unsubscribed from your emails in Brevo. Respect existing status keeps them blacklisted for email, so they are added to lists but do not receive campaigns. Always set to Active removes the email blacklist each time the member is synced."
+msgstr ""
+
+#: includes/admin.php:156
+msgid "Process Updates in the Background"
+msgstr ""
+
+#: includes/admin.php:162
+msgid "Yes, run updates in the background"
+msgstr ""
+
+#: includes/admin.php:163
+msgid "No, run updates immediately"
+msgstr ""
+
+#: includes/admin.php:165
+msgid "When enabled, contact updates and list changes will run in the background using Action Scheduler. This can improve performance during checkout, profile updates, and membership changes."
+msgstr ""
+
+#: includes/admin.php:169
+msgid "Debug Logging"
+msgstr ""
+
+#: includes/admin.php:175
+msgid "Yes, enable debug logging"
+msgstr ""
+
+#: includes/admin.php:176
+msgid "No, disable debug logging"
+msgstr ""
+
+#: includes/admin.php:180
+msgid "When enabled, the integration will write debug details to the log to help troubleshoot issues."
+msgstr ""
+
+#: includes/admin.php:189
+msgid "Download log."
+msgstr ""
+
+#: includes/admin.php:203
+msgid "Assign Lists"
+msgstr ""
+
+#: includes/admin.php:212
+msgid "Enter your API key above and save to connect to Brevo."
+msgstr ""
+
+#: includes/admin.php:216
+msgid "No lists found in your Brevo account."
+msgstr ""
+
+#: includes/admin.php:218
+#: includes/admin.php:227
+msgid "Click here to refresh lists"
+msgstr ""
+
+#: includes/admin.php:225
+msgid "Select the Brevo lists to add members to when they are added to each membership level."
+msgstr ""
+
+#: includes/admin.php:274
+msgid "Save Changes"
+msgstr ""
+
+#: pmpro-brevo.php:62
+msgid "Thank you for activating the Brevo Add On."
+msgstr ""
+
+#: pmpro-brevo.php:64
+msgid "Click here to configure settings."
+msgstr ""
+
+#: pmpro-brevo.php:86
+msgid "Settings"
+msgstr ""
+
+#: pmpro-brevo.php:106
+msgid "View Documentation"
+msgstr ""
+
+#: pmpro-brevo.php:106
+msgid "Docs"
+msgstr ""
+
+#: pmpro-brevo.php:107
+msgid "Visit Customer Support Forum"
+msgstr ""
+
+#: pmpro-brevo.php:107
+msgid "Support"
+msgstr ""
+
+#: pmpro-brevo.php:126
+msgid "Paid Memberships Pro - Brevo Add On requires Paid Memberships Pro to be installed and active."
+msgstr ""

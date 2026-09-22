@@ -38,7 +38,7 @@ function pmprobrevo_settings_page() {
 	$pmpro_levels = pmpro_sort_levels_by_order( $pmpro_levels );
 
 	// Handle form submission.
-	if ( isset( $_POST['pmprobrevo_settings_nonce'] ) && wp_verify_nonce( $_POST['pmprobrevo_settings_nonce'], 'pmprobrevo_save_settings' ) ) {
+	if ( isset( $_POST['pmprobrevo_settings_nonce'] ) && wp_verify_nonce( sanitize_key( wp_unslash( $_POST['pmprobrevo_settings_nonce'] ) ), 'pmprobrevo_save_settings' ) ) {
 		// Check if the API key changed so we can clear the list cache.
 		$old_api_key     = isset( $options['api_key'] ) ? $options['api_key'] : '';
 		$new_api_key     = empty( $_POST['api_key'] ) ? '' : sanitize_text_field( wp_unslash( $_POST['api_key'] ) );
