@@ -146,7 +146,7 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 			'LASTNAME'  => $user->last_name,
 		),
 	);
-	if ( ! empty( $subscribe_lists ) ) {
+	if ( $update_lists && ! empty( $subscribe_lists ) ) {
 		$contact_data['listIds'] = $subscribe_lists;
 	}
 
@@ -197,30 +197,58 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 
 	// ------------------------------------------------------------------
 	// Update by stored contact ID when we have one.
-	// PUT /contacts/{id} handles an email address change on the existing contact
-	// and removes lists via unlinkListIds in the same call.
+	// Look the contact up first so a deleted contact (404) falls back to the
+	// email upsert and so we know its current email and blacklist status.
 	// ------------------------------------------------------------------
-	$updated_by_id = false;
+	$updated_by_id     = false;
+	$email_blacklisted = null;
 	if ( ! empty( $contact_id ) ) {
+		$existing = $api->get_contact_by_id( $contact_id );
+		if ( is_wp_error( $existing ) ) {
+			$error_data = $existing->get_error_data();
+			if ( ! empty( $error_data['status'] ) && 404 === (int) $error_data['status'] ) {
+				// Contact was deleted in Brevo. Fall back to the email upsert below.
+				$log .= "Contact ID {$contact_id} no longer exists in Brevo. Falling back to upsert by email. ";
+				delete_user_meta( $user_id, 'pmprobrevo_contact_id' );
+				$contact_id = 0;
+			} else {
+				$log .= "Could not retrieve contact ID {$contact_id}: " . $existing->get_error_message() . ". ";
+				pmprobrevo_debug_log( $log );
+				return;
+			}
+		}
+	}
+
+	if ( ! empty( $contact_id ) ) {
+		$existing_email    = ! empty( $existing['email'] ) ? $existing['email'] : '';
+		$email_blacklisted = ! empty( $existing['emailBlacklisted'] );
+		$email_changed     = ( '' !== $existing_email && strcasecmp( $existing_email, $contact_data['email'] ) !== 0 );
+
 		$update_data = $contact_data;
 		unset( $update_data['email'] );
-		$update_data['attributes']['EMAIL'] = $contact_data['email'];
+		if ( $email_changed ) {
+			// Brevo removes the email blacklist when a blacklisted contact's email is changed.
+			if ( $email_blacklisted && 'active' !== $status_mode ) {
+				$log .= "WARNING: Contact {$contact_id} is blacklisted for email in Brevo and the member's email changed from {$existing_email} to {$contact_data['email']}. Not updating the email address because that would resubscribe them. Update it manually in Brevo if the member has consented. ";
+			} else {
+				$update_data['attributes']['EMAIL'] = $contact_data['email'];
+			}
+		}
 		if ( ! empty( $lists_to_remove ) ) {
 			$update_data['unlinkListIds'] = $lists_to_remove;
 		}
 
 		$result = $api->update_contact( $contact_id, $update_data );
 		if ( is_wp_error( $result ) ) {
-			// Contact was deleted or merged in Brevo. Fall back to the email upsert below.
-			$log .= "Could not update contact ID {$contact_id}: " . $result->get_error_message() . ". Falling back to upsert by email. ";
-			delete_user_meta( $user_id, 'pmprobrevo_contact_id' );
-			$contact_id = 0;
-		} else {
-			$updated_by_id = true;
-			$log .= "Updated contact ID {$contact_id} by ID. ";
-			if ( ! empty( $lists_to_remove ) ) {
-				$log .= "Removed list IDs: " . implode( ', ', $lists_to_remove ) . ". ";
-			}
+			$log .= "Error updating contact ID {$contact_id}: " . $result->get_error_message() . ". ";
+			pmprobrevo_debug_log( $log );
+			return;
+		}
+
+		$updated_by_id = true;
+		$log .= "Updated contact ID {$contact_id} by ID. ";
+		if ( ! empty( $lists_to_remove ) ) {
+			$log .= "Removed list IDs: " . implode( ', ', $lists_to_remove ) . ". ";
 		}
 	}
 
@@ -228,7 +256,6 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 	// Otherwise upsert by email.
 	// POST /contacts with updateEnabled is non-destructive — listIds here are ADDED, not replaced.
 	// ------------------------------------------------------------------
-	$email_blacklisted = null;
 	if ( ! $updated_by_id ) {
 		$result = $api->upsert_contact( $contact_data );
 
@@ -258,9 +285,8 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 			$response = $api->remove_contact_from_list( $contact_data['email'], $list_id );
 			if ( is_wp_error( $response ) ) {
 				$log .= "Error removing list ID {$list_id}: " . $response->get_error_message() . ". ";
-			} elseif ( ! empty( $response['contacts']['failure'] ) ) {
-				// Brevo reports contacts that were not in the list as failures. Not an error for us.
-				$log .= "Contact was not in list ID {$list_id}. ";
+			} elseif ( ! empty( $response['failure'] ) ) {
+				$log .= "Brevo could not remove the contact from list ID {$list_id} (not in list, or removal failed). ";
 			} else {
 				$log .= "Removed list ID {$list_id}. ";
 			}

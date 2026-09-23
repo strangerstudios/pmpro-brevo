@@ -177,7 +177,7 @@ function pmprobrevo_settings_page() {
 								</select>
 								<p class="description">
 									<?php
-									esc_html_e( 'When enabled, the integration will write debug details to the log to help troubleshoot issues.', 'pmpro-brevo' );
+									esc_html_e( 'When enabled, the integration will write debug details to the log to help troubleshoot issues. The log includes member email addresses, names, and list assignments, so enable it only while troubleshooting.', 'pmpro-brevo' );
 									if ( 'yes' === $enable_debug_log ) {
 										$log_file_link = add_query_arg(
 											array(

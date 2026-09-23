@@ -252,6 +252,18 @@ class PMPro_Brevo_API {
 	}
 
 	/**
+	 * Get a contact by its Brevo contact ID.
+	 *
+	 * @since TBD
+	 *
+	 * @param int $contact_id Brevo contact ID.
+	 * @return array|WP_Error Contact data. WP_Error with status 404 if the contact no longer exists.
+	 */
+	public function get_contact_by_id( $contact_id ) {
+		return $this->request( '/contacts/' . intval( $contact_id ), 'GET', array(), array( 'identifierType' => 'contact_id' ) );
+	}
+
+	/**
 	 * Create or update a contact (upsert).
 	 *
 	 * POST /contacts with updateEnabled is a non-destructive upsert in Brevo —
