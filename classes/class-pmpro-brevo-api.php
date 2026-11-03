@@ -84,6 +84,19 @@ class PMPro_Brevo_API {
 	}
 
 	/**
+	 * Replace the API key used for requests, e.g. right after a new key is saved.
+	 *
+	 * @since TBD
+	 *
+	 * @param string $api_key API key.
+	 */
+	public function set_api_key( $api_key ) {
+		$this->api_key     = (string) $api_key;
+		$this->connected   = ! empty( $api_key );
+		$this->lists_cache = null;
+	}
+
+	/**
 	 * Make an API request.
 	 *
 	 * @since TBD
@@ -123,6 +136,7 @@ class PMPro_Brevo_API {
 
 		if ( is_wp_error( $response ) ) {
 			pmprobrevo_debug_log( "API error ({$method} {$endpoint}): " . $response->get_error_message() );
+			$response->add_data( array( 'status' => 0 ) );
 			return $response;
 		}
 
@@ -135,8 +149,9 @@ class PMPro_Brevo_API {
 		}
 
 		if ( 429 === $code ) {
-			$retry_after = wp_remote_retrieve_header( $response, 'retry-after' );
-			pmprobrevo_debug_log( "Rate limited ({$method} {$endpoint}). Retry-After: {$retry_after}" );
+			// Seconds until the rate limit window resets.
+			$retry_after = (int) wp_remote_retrieve_header( $response, 'x-sib-ratelimit-reset' );
+			pmprobrevo_debug_log( "Rate limited ({$method} {$endpoint}). Resets in {$retry_after} seconds." );
 			return new WP_Error( 'rate_limited', __( 'Brevo API rate limit reached. Please try again later.', 'pmpro-brevo' ), array( 'status' => 429, 'retry_after' => $retry_after ) );
 		}
 
@@ -150,6 +165,76 @@ class PMPro_Brevo_API {
 		}
 
 		return is_array( $data ) ? $data : array();
+	}
+
+	/**
+	 * Get the HTTP status code from an error returned by request().
+	 *
+	 * @since TBD
+	 *
+	 * @param WP_Error $error Error returned by request().
+	 * @return int HTTP status, or 0 for a transport error (timeout, DNS, etc.).
+	 */
+	public static function get_error_status( $error ) {
+		$data = $error->get_error_data();
+		return ( is_array( $data ) && ! empty( $data['status'] ) ) ? (int) $data['status'] : 0;
+	}
+
+	/**
+	 * Check whether a request error is temporary and worth retrying.
+	 *
+	 * Transport errors, 408, 425, 429 and 5xx responses are retryable.
+	 *
+	 * @since TBD
+	 *
+	 * @param WP_Error $error Error returned by request().
+	 * @return bool
+	 */
+	public static function is_retryable_error( $error ) {
+		if ( ! is_wp_error( $error ) || 'not_connected' === $error->get_error_code() ) {
+			return false;
+		}
+
+		$status = self::get_error_status( $error );
+		return 0 === $status || in_array( $status, array( 408, 425, 429 ), true ) || $status >= 500;
+	}
+
+	// ------------------------------------------------------------------
+	// Account
+	// ------------------------------------------------------------------
+
+	/**
+	 * Get the Brevo account for the current API key.
+	 *
+	 * Used to test the connection and to tell whether a new API key belongs to a different account.
+	 *
+	 * @since TBD
+	 *
+	 * @return array|WP_Error Account data (email, companyName, organization_id, ...).
+	 */
+	public function get_account() {
+		return $this->request( '/account' );
+	}
+
+	/**
+	 * Get a stable identifier for a Brevo account.
+	 *
+	 * @since TBD
+	 *
+	 * @param array $account Account data from get_account().
+	 * @return string Account identifier, or an empty string if none is available.
+	 */
+	public static function get_account_fingerprint( $account ) {
+		if ( ! is_array( $account ) ) {
+			return '';
+		}
+		if ( ! empty( $account['organization_id'] ) ) {
+			return 'org:' . $account['organization_id'];
+		}
+		if ( ! empty( $account['email'] ) ) {
+			return 'email:' . strtolower( $account['email'] );
+		}
+		return '';
 	}
 
 	// ------------------------------------------------------------------
@@ -222,19 +307,6 @@ class PMPro_Brevo_API {
 		return $all_lists;
 	}
 
-	/**
-	 * Remove a contact from a list.
-	 *
-	 * @since TBD
-	 *
-	 * @param string $email   Contact email address.
-	 * @param int    $list_id List ID.
-	 * @return array|WP_Error
-	 */
-	public function remove_contact_from_list( $email, $list_id ) {
-		return $this->request( '/contacts/lists/' . intval( $list_id ) . '/contacts/remove', 'POST', array( 'emails' => array( $email ) ) );
-	}
-
 	// ------------------------------------------------------------------
 	// Contacts
 	// ------------------------------------------------------------------
@@ -295,5 +367,21 @@ class PMPro_Brevo_API {
 	 */
 	public function update_contact( $contact_id, $contact_data ) {
 		return $this->request( '/contacts/' . intval( $contact_id ), 'PUT', $contact_data, array( 'identifierType' => 'contact_id' ) );
+	}
+
+	/**
+	 * Update an existing contact by email address.
+	 *
+	 * Used to remove lists from a contact when its Brevo ID isn't known.
+	 * Returns a 404 WP_Error if no contact has this email.
+	 *
+	 * @since TBD
+	 *
+	 * @param string $email        Contact email address.
+	 * @param array  $contact_data Contact data (attributes, listIds, unlinkListIds).
+	 * @return array|WP_Error Response data.
+	 */
+	public function update_contact_by_email( $email, $contact_data ) {
+		return $this->request( '/contacts/' . rawurlencode( $email ), 'PUT', $contact_data, array( 'identifierType' => 'email_id' ) );
 	}
 }

@@ -39,6 +39,16 @@ function pmprobrevo_load_plugin() {
 add_action( 'plugins_loaded', 'pmprobrevo_load_plugin' );
 
 /**
+ * Load the plugin's bundled translations.
+ *
+ * @since TBD
+ */
+function pmprobrevo_load_textdomain() {
+	load_plugin_textdomain( 'pmpro-brevo', false, dirname( PMPROBREVO_BASENAME ) . '/languages' );
+}
+add_action( 'init', 'pmprobrevo_load_textdomain' );
+
+/**
  * Show a notice after the plugin is activated.
  *
  * @since TBD
