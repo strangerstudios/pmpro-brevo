@@ -63,13 +63,22 @@ function pmprobrevo_settings_page() {
 
 			if ( is_wp_error( $new_account ) && $had_account ) {
 				// Keep the previous key so a mistyped key or a Brevo outage can't reset the saved list and contact IDs.
-				if ( PMPro_Brevo_API::is_retryable_error( $new_account ) ) {
-					// translators: %s: Error message from Brevo.
-					$notices[] = sprintf( __( 'Could not reach Brevo to verify the new API key (%s). Your previous API key was kept. Try again in a few minutes.', 'pmpro-brevo' ), $new_account->get_error_message() );
+				$retryable = PMPro_Brevo_API::is_retryable_error( $new_account );
+				if ( '' === $old_api_key ) {
+					$notices[] = $retryable
+						// translators: %s: Error message from Brevo.
+						? sprintf( __( 'Could not reach Brevo to verify the new API key (%s), so it was not saved. Try again in a few minutes.', 'pmpro-brevo' ), $new_account->get_error_message() )
+						// translators: %s: Error message from Brevo.
+						: sprintf( __( 'Brevo did not accept the new API key (%s), so it was not saved.', 'pmpro-brevo' ), $new_account->get_error_message() );
 				} else {
-					// translators: %s: Error message from Brevo.
-					$notices[] = sprintf( __( 'Brevo did not accept the new API key (%s). Your previous API key was kept.', 'pmpro-brevo' ), $new_account->get_error_message() );
+					$notices[] = $retryable
+						// translators: %s: Error message from Brevo.
+						? sprintf( __( 'Could not reach Brevo to verify the new API key (%s). Your previous API key was kept. Try again in a few minutes.', 'pmpro-brevo' ), $new_account->get_error_message() )
+						// translators: %s: Error message from Brevo.
+						: sprintf( __( 'Brevo did not accept the new API key (%s). Your previous API key was kept.', 'pmpro-brevo' ), $new_account->get_error_message() );
 				}
+				pmprobrevo_debug_log( 'New API key was not saved because GET /account failed: ' . $new_account->get_error_message() );
+				$api->set_api_key( $old_api_key );
 				$new_api_key     = $old_api_key;
 				$api_key_changed = false;
 			} elseif ( ! is_wp_error( $new_account ) ) {
@@ -86,6 +95,7 @@ function pmprobrevo_settings_page() {
 
 					// List and contact IDs are per-account, so they can't be reused with a different account.
 					if ( '' === $old_fingerprint || '' === $new_fingerprint || $old_fingerprint !== $new_fingerprint ) {
+						pmprobrevo_debug_log( "API key changed. Resetting list assignments and contact IDs. Previous account: '{$old_fingerprint}'. New account: '{$new_fingerprint}'. An empty value means the account could not be identified." );
 						$options       = pmprobrevo_reset_account_data( $options );
 						$account_reset = true;
 						$notices[]     = __( 'The new API key is for a different Brevo account, or the previous account could not be identified. List assignments and stored Brevo contact IDs were reset. Assign lists again below.', 'pmpro-brevo' );
