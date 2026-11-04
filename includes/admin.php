@@ -39,7 +39,7 @@ function pmprobrevo_settings_page() {
 
 	// Handle form submission.
 	$notices = array();
-	if ( isset( $_POST['pmprobrevo_settings_nonce'] ) && wp_verify_nonce( sanitize_key( wp_unslash( $_POST['pmprobrevo_settings_nonce'] ) ), 'pmprobrevo_save_settings' ) ) {
+	if ( current_user_can( 'manage_options' ) && isset( $_POST['pmprobrevo_settings_nonce'] ) && wp_verify_nonce( sanitize_key( wp_unslash( $_POST['pmprobrevo_settings_nonce'] ) ), 'pmprobrevo_save_settings' ) ) {
 		// The saved key is rendered masked, so an unchanged mask means keep the saved key.
 		$old_api_key     = isset( $options['api_key'] ) ? $options['api_key'] : '';
 		$posted_api_key  = empty( $_POST['api_key'] ) ? '' : sanitize_text_field( wp_unslash( $_POST['api_key'] ) );
@@ -47,7 +47,6 @@ function pmprobrevo_settings_page() {
 		$api_key_changed = ( $old_api_key !== $new_api_key );
 
 		// Sanitize and save all general settings.
-		$options['api_key']                = $new_api_key;
 		$options['update_on_profile_save'] = empty( $_POST['update_on_profile_save'] ) ? 'yes' : sanitize_text_field( wp_unslash( $_POST['update_on_profile_save'] ) );
 		$options['unsubscribe']            = empty( $_POST['unsubscribe'] ) ? 'yes' : sanitize_text_field( wp_unslash( $_POST['unsubscribe'] ) );
 		$options['contact_status_mode']    = empty( $_POST['contact_status_mode'] ) ? 'respect' : sanitize_text_field( wp_unslash( $_POST['contact_status_mode'] ) );
@@ -55,27 +54,54 @@ function pmprobrevo_settings_page() {
 		$options['enable_debug_log']       = empty( $_POST['enable_debug_log'] ) ? 'no' : sanitize_text_field( wp_unslash( $_POST['enable_debug_log'] ) );
 
 		$account_reset = false;
+		if ( $api_key_changed && '' !== $new_api_key ) {
+			$api = PMPro_Brevo_API::get_instance();
+			$api->set_api_key( $new_api_key );
+			$new_account        = $api->get_account();
+			$stored_fingerprint = isset( $options['account_fingerprint'] ) ? $options['account_fingerprint'] : '';
+			$had_account        = '' !== $stored_fingerprint || '' !== $old_api_key;
+
+			if ( is_wp_error( $new_account ) && $had_account ) {
+				// Keep the previous key so a mistyped key or a Brevo outage can't reset the saved list and contact IDs.
+				if ( PMPro_Brevo_API::is_retryable_error( $new_account ) ) {
+					// translators: %s: Error message from Brevo.
+					$notices[] = sprintf( __( 'Could not reach Brevo to verify the new API key (%s). Your previous API key was kept. Try again in a few minutes.', 'pmpro-brevo' ), $new_account->get_error_message() );
+				} else {
+					// translators: %s: Error message from Brevo.
+					$notices[] = sprintf( __( 'Brevo did not accept the new API key (%s). Your previous API key was kept.', 'pmpro-brevo' ), $new_account->get_error_message() );
+				}
+				$new_api_key     = $old_api_key;
+				$api_key_changed = false;
+			} elseif ( ! is_wp_error( $new_account ) ) {
+				$new_fingerprint = PMPro_Brevo_API::get_account_fingerprint( $new_account );
+
+				if ( $had_account ) {
+					// Identify the previous account from the stored fingerprint, or from the previous key if none was stored.
+					$old_fingerprint = $stored_fingerprint;
+					if ( '' === $old_fingerprint && '' !== $old_api_key ) {
+						$api->set_api_key( $old_api_key );
+						$old_fingerprint = PMPro_Brevo_API::get_account_fingerprint( $api->get_account() );
+						$api->set_api_key( $new_api_key );
+					}
+
+					// List and contact IDs are per-account, so they can't be reused with a different account.
+					if ( '' === $old_fingerprint || '' === $new_fingerprint || $old_fingerprint !== $new_fingerprint ) {
+						$options       = pmprobrevo_reset_account_data( $options );
+						$account_reset = true;
+						$notices[]     = __( 'The new API key is for a different Brevo account, or the previous account could not be identified. List assignments and stored Brevo contact IDs were reset. Assign lists again below.', 'pmpro-brevo' );
+					}
+				}
+
+				if ( '' !== $new_fingerprint ) {
+					$options['account_fingerprint'] = $new_fingerprint;
+				}
+			}
+		}
+
+		$options['api_key'] = $new_api_key;
 		if ( $api_key_changed ) {
 			// Clear cached lists so they are re-fetched with the new key.
 			delete_transient( 'pmprobrevo_all_lists' );
-
-			if ( '' !== $new_api_key ) {
-				$api = PMPro_Brevo_API::get_instance();
-				$api->set_api_key( $new_api_key );
-				$new_fingerprint    = PMPro_Brevo_API::get_account_fingerprint( $api->get_account() );
-				$stored_fingerprint = isset( $options['account_fingerprint'] ) ? $options['account_fingerprint'] : '';
-				$same_account       = '' !== $new_fingerprint && $new_fingerprint === $stored_fingerprint;
-				$had_account        = '' !== $stored_fingerprint || '' !== $old_api_key;
-
-				// List and contact IDs are per-account, so they can't be reused with a different (or unverifiable) account.
-				if ( ! $same_account && $had_account ) {
-					$options       = pmprobrevo_reset_account_data( $options );
-					$account_reset = true;
-					$notices[]     = __( 'The new API key is for a different Brevo account, or the account could not be verified. List assignments and stored Brevo contact IDs were reset. Assign lists again below.', 'pmpro-brevo' );
-				}
-
-				$options['account_fingerprint'] = $new_fingerprint;
-			}
 		}
 
 		// Save per-level list assignments if the lists section was rendered for the same account.
@@ -95,8 +121,15 @@ function pmprobrevo_settings_page() {
 			if ( ! empty( $_POST['forget_retired_lists'] ) ) {
 				$retired_lists = array();
 			}
-			$options['retired_lists'] = array_values( array_diff( array_unique( $retired_lists ), $options['level_lists_all'] ) );
-		} elseif ( ! empty( $_POST['level_lists_shown'] ) && ! $account_reset ) {
+			$retired_lists = array_diff( array_unique( $retired_lists ), $options['level_lists_all'] );
+
+			// Drop retired lists that no longer exist in Brevo.
+			$brevo_lists = PMPro_Brevo_API::get_instance()->get_lists();
+			if ( ! empty( $brevo_lists ) ) {
+				$retired_lists = array_intersect( $retired_lists, array_map( 'intval', wp_list_pluck( $brevo_lists, 'id' ) ) );
+			}
+			$options['retired_lists'] = array_values( $retired_lists );
+		} elseif ( ! empty( $_POST['level_lists_shown'] ) && ! $account_reset && '' !== $new_api_key ) {
 			$notices[] = __( 'List assignments were not saved because the API key changed. Review the lists below and save again.', 'pmpro-brevo' );
 		}
 
@@ -119,8 +152,11 @@ function pmprobrevo_settings_page() {
 	// Test the connection so a bad or revoked key isn't mistaken for an empty account.
 	$account = $api->is_connected() ? $api->get_account() : null;
 	if ( is_array( $account ) && empty( $options['account_fingerprint'] ) ) {
-		$options['account_fingerprint'] = PMPro_Brevo_API::get_account_fingerprint( $account );
-		update_option( 'pmprobrevo_options', $options );
+		$account_fingerprint = PMPro_Brevo_API::get_account_fingerprint( $account );
+		if ( '' !== $account_fingerprint ) {
+			$options['account_fingerprint'] = $account_fingerprint;
+			update_option( 'pmprobrevo_options', $options );
+		}
 	}
 	?>
 	<div class="wrap pmpro_admin">
@@ -424,6 +460,11 @@ function pmprobrevo_reset_account_data( $options ) {
 
 	delete_metadata( 'user', 0, 'pmprobrevo_contact_id', '', true );
 	delete_metadata( 'user', 0, 'pmprobrevo_synced', '', true );
+
+	// Pending removals carry the old account's contact IDs.
+	if ( function_exists( 'as_unschedule_all_actions' ) ) {
+		as_unschedule_all_actions( 'pmprobrevo_remove_deleted_contact' );
+	}
 
 	return $options;
 }

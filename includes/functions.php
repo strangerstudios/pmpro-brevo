@@ -152,13 +152,20 @@ function pmprobrevo_handle_task_result( $result, $hook, $args, $attempt, $in_act
 		$delay       = min( $delay, HOUR_IN_SECONDS );
 
 		$args['attempt'] = $attempt + 1;
-		PMPro_Action_Scheduler::instance()->maybe_add_task( $hook, $args, 'pmprobrevo_sync_tasks', time() + $delay );
 
-		pmprobrevo_debug_log( "Task {$hook} failed with a temporary error: " . $result->get_error_message() . ". Retry {$args['attempt']} of {$max_retries} scheduled in {$delay} seconds. Args: " . wp_json_encode( $args ) );
-		return;
+		// Returns null when the same retry is already queued, or 0 if scheduling failed.
+		$scheduled = PMPro_Action_Scheduler::instance()->maybe_add_task( $hook, $args, 'pmprobrevo_sync_tasks', time() + $delay );
+		if ( 0 !== $scheduled ) {
+			pmprobrevo_debug_log( "Task {$hook} failed with a temporary error: " . $result->get_error_message() . ". Retry {$args['attempt']} of {$max_retries} scheduled in {$delay} seconds. Args: " . wp_json_encode( $args ) );
+			return;
+		}
+
+		unset( $args['attempt'] );
+		$message = "Task {$hook} failed and its retry could not be scheduled: " . $result->get_error_message() . ". Args: " . wp_json_encode( $args );
+	} else {
+		$message = "Task {$hook} failed and will not be retried: " . $result->get_error_message() . ". Args: " . wp_json_encode( $args );
 	}
 
-	$message = "Task {$hook} failed and will not be retried: " . $result->get_error_message() . ". Args: " . wp_json_encode( $args );
 	pmprobrevo_debug_log( $message );
 
 	if ( $in_action_scheduler ) {
@@ -314,7 +321,7 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 
 		// The new email may already belong to another Brevo contact. Sync everything else and keep the old email.
 		if ( isset( $update_data['attributes']['EMAIL'] ) && pmprobrevo_is_identifier_conflict( $result ) ) {
-			$log .= "WARNING: Could not change contact {$contact_id}'s email to {$contact_data['email']} because Brevo reported a conflict (" . $result->get_error_message() . "). Another Brevo contact probably uses that email. Syncing without the email change. Merge the contacts manually in Brevo if needed. ";
+			$log .= "WARNING: Could not change contact {$contact_id}'s email to {$contact_data['email']}. Brevo reported a possible conflict (" . $result->get_error_message() . "), so another Brevo contact may already use that email. Syncing without the email change. Merge the contacts manually in Brevo if needed. ";
 			unset( $update_data['attributes']['EMAIL'] );
 			$result = $api->update_contact( $contact_id, $update_data );
 		}
@@ -430,9 +437,17 @@ function pmprobrevo_remove_contact_from_controlled_lists( $contact_id, $email ) 
 	}
 
 	$unlink_data = array( 'unlinkListIds' => $lists_to_remove );
-	$result      = ! empty( $contact_id ) ? $api->update_contact( $contact_id, $unlink_data ) : $api->update_contact_by_email( $email, $unlink_data );
+	$log         = "Removing deleted user's contact (ID: " . ( $contact_id ? $contact_id : 'unknown' ) . ", email: {$email}) from list IDs " . implode( ', ', $lists_to_remove ) . ". ";
 
-	$log = "Removing deleted user's contact (ID: " . ( $contact_id ? $contact_id : 'unknown' ) . ", email: {$email}) from list IDs " . implode( ', ', $lists_to_remove ) . ". ";
+	$result = ! empty( $contact_id ) ? $api->update_contact( $contact_id, $unlink_data ) : null;
+	if ( null === $result || ( is_wp_error( $result ) && 404 === PMPro_Brevo_API::get_error_status( $result ) ) ) {
+		// No ID, or the contact was deleted and may have been recreated with the same email.
+		if ( null !== $result ) {
+			$log .= "Contact ID {$contact_id} not found. Trying by email. ";
+		}
+		$result = $api->update_contact_by_email( $email, $unlink_data );
+	}
+
 	if ( is_wp_error( $result ) ) {
 		if ( 404 === PMPro_Brevo_API::get_error_status( $result ) ) {
 			pmprobrevo_debug_log( $log . "Contact not found in Brevo. Nothing to remove." );
@@ -467,10 +482,10 @@ function pmprobrevo_run_remove_deleted_contact_task( $contact_id, $email, $attem
 add_action( 'pmprobrevo_remove_deleted_contact', 'pmprobrevo_run_remove_deleted_contact_task', 10, 3 );
 
 /**
- * Check whether a Brevo error is an identifier conflict, such as an email that belongs to another contact.
+ * Check whether a Brevo error looks like an identifier conflict, such as an email that belongs to another contact.
  *
  * Brevo documents a 4xx response for identifier conflicts but not a specific error code,
- * so this treats any 4xx other than auth, not found and rate limit errors as a possible conflict.
+ * so this checks for the duplicate_parameter code or a message about an existing or duplicate value.
  *
  * @since TBD
  *
@@ -483,7 +498,16 @@ function pmprobrevo_is_identifier_conflict( $result ) {
 	}
 
 	$status = PMPro_Brevo_API::get_error_status( $result );
-	return $status >= 400 && $status < 500 && ! in_array( $status, array( 401, 403, 404, 408, 425, 429 ), true );
+	if ( $status < 400 || $status >= 500 || in_array( $status, array( 401, 403, 404, 408, 425, 429 ), true ) ) {
+		return false;
+	}
+
+	$error_data = $result->get_error_data();
+	$response   = ( is_array( $error_data ) && ! empty( $error_data['response'] ) && is_array( $error_data['response'] ) ) ? $error_data['response'] : array();
+	$code       = isset( $response['code'] ) ? (string) $response['code'] : '';
+	$message    = isset( $response['message'] ) ? (string) $response['message'] : '';
+
+	return 'duplicate_parameter' === $code || 1 === preg_match( '/already|exist|duplicate/i', $message );
 }
 
 // ------------------------------------------------------------------
