@@ -38,22 +38,85 @@ function pmprobrevo_settings_page() {
 	$pmpro_levels = pmpro_sort_levels_by_order( $pmpro_levels );
 
 	// Handle form submission.
-	if ( isset( $_POST['pmprobrevo_settings_nonce'] ) && wp_verify_nonce( sanitize_key( wp_unslash( $_POST['pmprobrevo_settings_nonce'] ) ), 'pmprobrevo_save_settings' ) ) {
-		// Check if the API key changed so we can clear the list cache.
+	$notices = array();
+	if ( current_user_can( 'manage_options' ) && isset( $_POST['pmprobrevo_settings_nonce'] ) && wp_verify_nonce( sanitize_key( wp_unslash( $_POST['pmprobrevo_settings_nonce'] ) ), 'pmprobrevo_save_settings' ) ) {
+		// The saved key is rendered masked, so an unchanged mask means keep the saved key.
 		$old_api_key     = isset( $options['api_key'] ) ? $options['api_key'] : '';
-		$new_api_key     = empty( $_POST['api_key'] ) ? '' : sanitize_text_field( wp_unslash( $_POST['api_key'] ) );
+		$posted_api_key  = empty( $_POST['api_key'] ) ? '' : sanitize_text_field( wp_unslash( $_POST['api_key'] ) );
+		$new_api_key     = ( '' !== $old_api_key && pmprobrevo_mask_api_key( $old_api_key ) === $posted_api_key ) ? $old_api_key : $posted_api_key;
 		$api_key_changed = ( $old_api_key !== $new_api_key );
 
 		// Sanitize and save all general settings.
-		$options['api_key']                = $new_api_key;
 		$options['update_on_profile_save'] = empty( $_POST['update_on_profile_save'] ) ? 'yes' : sanitize_text_field( wp_unslash( $_POST['update_on_profile_save'] ) );
 		$options['unsubscribe']            = empty( $_POST['unsubscribe'] ) ? 'yes' : sanitize_text_field( wp_unslash( $_POST['unsubscribe'] ) );
 		$options['contact_status_mode']    = empty( $_POST['contact_status_mode'] ) ? 'respect' : sanitize_text_field( wp_unslash( $_POST['contact_status_mode'] ) );
 		$options['enable_async']           = empty( $_POST['enable_async'] ) ? 'yes' : sanitize_text_field( wp_unslash( $_POST['enable_async'] ) );
 		$options['enable_debug_log']       = empty( $_POST['enable_debug_log'] ) ? 'no' : sanitize_text_field( wp_unslash( $_POST['enable_debug_log'] ) );
 
-		// Save per-level list assignments if the lists section was rendered.
-		if ( ! empty( $_POST['level_lists_shown'] ) ) {
+		$account_reset = false;
+		if ( $api_key_changed && '' !== $new_api_key ) {
+			$api = PMPro_Brevo_API::get_instance();
+			$api->set_api_key( $new_api_key );
+			$new_account        = $api->get_account();
+			$stored_fingerprint = isset( $options['account_fingerprint'] ) ? $options['account_fingerprint'] : '';
+			$had_account        = '' !== $stored_fingerprint || '' !== $old_api_key;
+
+			if ( is_wp_error( $new_account ) && $had_account ) {
+				// Keep the previous key so a mistyped key or a Brevo outage can't reset the saved list and contact IDs.
+				$retryable = PMPro_Brevo_API::is_retryable_error( $new_account );
+				if ( '' === $old_api_key ) {
+					$notices[] = $retryable
+						// translators: %s: Error message from Brevo.
+						? sprintf( __( 'Could not reach Brevo to verify the new API key (%s), so it was not saved. Try again in a few minutes.', 'pmpro-brevo' ), $new_account->get_error_message() )
+						// translators: %s: Error message from Brevo.
+						: sprintf( __( 'Brevo did not accept the new API key (%s), so it was not saved.', 'pmpro-brevo' ), $new_account->get_error_message() );
+				} else {
+					$notices[] = $retryable
+						// translators: %s: Error message from Brevo.
+						? sprintf( __( 'Could not reach Brevo to verify the new API key (%s). Your previous API key was kept. Try again in a few minutes.', 'pmpro-brevo' ), $new_account->get_error_message() )
+						// translators: %s: Error message from Brevo.
+						: sprintf( __( 'Brevo did not accept the new API key (%s). Your previous API key was kept.', 'pmpro-brevo' ), $new_account->get_error_message() );
+				}
+				pmprobrevo_debug_log( 'New API key was not saved because GET /account failed: ' . $new_account->get_error_message() );
+				$api->set_api_key( $old_api_key );
+				$new_api_key     = $old_api_key;
+				$api_key_changed = false;
+			} elseif ( ! is_wp_error( $new_account ) ) {
+				$new_fingerprint = PMPro_Brevo_API::get_account_fingerprint( $new_account );
+
+				if ( $had_account ) {
+					// Identify the previous account from the stored fingerprint, or from the previous key if none was stored.
+					$old_fingerprint = $stored_fingerprint;
+					if ( '' === $old_fingerprint && '' !== $old_api_key ) {
+						$api->set_api_key( $old_api_key );
+						$old_fingerprint = PMPro_Brevo_API::get_account_fingerprint( $api->get_account() );
+						$api->set_api_key( $new_api_key );
+					}
+
+					// List and contact IDs are per-account, so they can't be reused with a different account.
+					if ( '' === $old_fingerprint || '' === $new_fingerprint || $old_fingerprint !== $new_fingerprint ) {
+						pmprobrevo_debug_log( "API key changed. Resetting list assignments and contact IDs. Previous account: '{$old_fingerprint}'. New account: '{$new_fingerprint}'. An empty value means the account could not be identified." );
+						$options       = pmprobrevo_reset_account_data( $options );
+						$account_reset = true;
+						$notices[]     = __( 'The new API key is for a different Brevo account, or the previous account could not be identified. List assignments and stored Brevo contact IDs were reset. Assign lists again below.', 'pmpro-brevo' );
+					}
+				}
+
+				if ( '' !== $new_fingerprint ) {
+					$options['account_fingerprint'] = $new_fingerprint;
+				}
+			}
+		}
+
+		$options['api_key'] = $new_api_key;
+		if ( $api_key_changed ) {
+			// Clear cached lists so they are re-fetched with the new key.
+			delete_transient( 'pmprobrevo_all_lists' );
+		}
+
+		// Save per-level list assignments if the lists section was rendered for the same account.
+		if ( ! empty( $_POST['level_lists_shown'] ) && ! $api_key_changed ) {
+			$old_controlled_lists       = ! empty( $options['level_lists_all'] ) ? array_map( 'intval', (array) $options['level_lists_all'] ) : array();
 			$options['level_lists_all'] = array();
 			foreach ( $pmpro_levels as $level ) {
 				$key             = 'level_lists_' . $level->id;
@@ -61,24 +124,50 @@ function pmprobrevo_settings_page() {
 				$options['level_lists_all'] = array_merge( $options['level_lists_all'], $options[ $key ] );
 			}
 			$options['level_lists_all'] = array_values( array_unique( $options['level_lists_all'] ) );
+
+			// Keep removing members from lists that were unassigned from every level, until the admin opts out.
+			$retired_lists = ! empty( $options['retired_lists'] ) ? array_map( 'intval', (array) $options['retired_lists'] ) : array();
+			$retired_lists = array_merge( $retired_lists, array_diff( $old_controlled_lists, $options['level_lists_all'] ) );
+			if ( ! empty( $_POST['forget_retired_lists'] ) ) {
+				$retired_lists = array();
+			}
+			$retired_lists = array_diff( array_unique( $retired_lists ), $options['level_lists_all'] );
+
+			// Drop retired lists that no longer exist in Brevo.
+			$brevo_lists = PMPro_Brevo_API::get_instance()->get_lists();
+			if ( ! empty( $brevo_lists ) ) {
+				$retired_lists = array_intersect( $retired_lists, array_map( 'intval', wp_list_pluck( $brevo_lists, 'id' ) ) );
+			}
+			$options['retired_lists'] = array_values( $retired_lists );
+		} elseif ( ! empty( $_POST['level_lists_shown'] ) && ! $account_reset && '' !== $new_api_key ) {
+			$notices[] = __( 'List assignments were not saved because the API key changed. Review the lists below and save again.', 'pmpro-brevo' );
 		}
 
 		update_option( 'pmprobrevo_options', $options );
-
-		if ( $api_key_changed ) {
-			// Clear cached lists so they are re-fetched with the new key.
-			delete_transient( 'pmprobrevo_all_lists' );
-		}
+		PMPro_Brevo_API::get_instance()->set_api_key( $options['api_key'] );
 
 		// If debug logging was enabled, write a log entry to confirm it works.
 		pmprobrevo_debug_log( 'PMPro Brevo settings updated.' );
 
 		// Show a success message.
 		echo '<div class="updated"><p>' . esc_html__( 'Settings saved.', 'pmpro-brevo' ) . '</p></div>';
+		foreach ( $notices as $notice ) {
+			echo '<div class="notice notice-warning"><p>' . esc_html( $notice ) . '</p></div>';
+		}
 	}
 
 	// Get the API instance. Called after save so it reads the fresh option.
 	$api = PMPro_Brevo_API::get_instance();
+
+	// Test the connection so a bad or revoked key isn't mistaken for an empty account.
+	$account = $api->is_connected() ? $api->get_account() : null;
+	if ( is_array( $account ) && empty( $options['account_fingerprint'] ) ) {
+		$account_fingerprint = PMPro_Brevo_API::get_account_fingerprint( $account );
+		if ( '' !== $account_fingerprint ) {
+			$options['account_fingerprint'] = $account_fingerprint;
+			update_option( 'pmprobrevo_options', $options );
+		}
+	}
 	?>
 	<div class="wrap pmpro_admin">
 		<h1><?php esc_html_e( 'Brevo Settings', 'pmpro-brevo' ); ?></h1>
@@ -105,13 +194,50 @@ function pmprobrevo_settings_page() {
 								<label for="api_key"><?php esc_html_e( 'API Key', 'pmpro-brevo' ); ?></label>
 							</th>
 							<td>
-								<input type="password" name="api_key" id="api_key" value="<?php echo esc_attr( isset( $options['api_key'] ) ? $options['api_key'] : '' ); ?>" class="regular-text" autocomplete="off">
+								<input type="password" name="api_key" id="api_key" value="<?php echo esc_attr( ! empty( $options['api_key'] ) ? pmprobrevo_mask_api_key( $options['api_key'] ) : '' ); ?>" class="regular-text" autocomplete="off">
 								<p class="description">
-									<?php esc_html_e( 'Your API key is used to connect your Brevo account to this membership site.', 'pmpro-brevo' ); ?>
+									<?php esc_html_e( 'Your API key is used to connect your Brevo account to this membership site. The saved key is masked. Leave it unchanged to keep it, or clear the field to disconnect.', 'pmpro-brevo' ); ?>
 									<a href="https://app.brevo.com/settings/keys/api" target="_blank" rel="noopener"><?php esc_html_e( 'Find your API key in Brevo under SMTP & API > API Keys.', 'pmpro-brevo' ); ?></a>
 								</p>
 							</td>
 						</tr>
+						<?php if ( $api->is_connected() ) { ?>
+							<tr>
+								<th scope="row"><?php esc_html_e( 'Connection Status', 'pmpro-brevo' ); ?></th>
+								<td>
+									<?php
+									if ( is_wp_error( $account ) ) {
+										?>
+										<div class="pmpro_message pmpro_error">
+											<p>
+												<?php
+												// translators: %s: Error message from Brevo.
+												echo esc_html( sprintf( __( 'Could not connect to Brevo: %s', 'pmpro-brevo' ), $account->get_error_message() ) );
+												?>
+											</p>
+										</div>
+										<?php
+									} else {
+										$account_name = ! empty( $account['companyName'] ) ? $account['companyName'] : ( ! empty( $account['email'] ) ? $account['email'] : '' );
+										?>
+										<div class="pmpro_message pmpro_success">
+											<p>
+												<?php
+												if ( '' !== $account_name ) {
+													// translators: %s: Brevo account company name or email.
+													echo esc_html( sprintf( __( 'Connected to the Brevo account %s.', 'pmpro-brevo' ), $account_name ) );
+												} else {
+													esc_html_e( 'Connected to Brevo.', 'pmpro-brevo' );
+												}
+												?>
+											</p>
+										</div>
+										<?php
+									}
+									?>
+								</td>
+							</tr>
+						<?php } ?>
 						<tr>
 							<th scope="row"><label for="update_on_profile_save"><?php esc_html_e( 'Sync on Profile Update', 'pmpro-brevo' ); ?></label></th>
 							<td>
@@ -178,7 +304,7 @@ function pmprobrevo_settings_page() {
 								<p class="description">
 									<?php
 									esc_html_e( 'When enabled, the integration will write debug details to the log to help troubleshoot issues. The log includes member email addresses, names, and list assignments, so enable it only while troubleshooting.', 'pmpro-brevo' );
-									if ( 'yes' === $enable_debug_log ) {
+									if ( 'yes' === $enable_debug_log && function_exists( 'pmpro_get_restricted_file_path' ) ) {
 										$log_file_link = add_query_arg(
 											array(
 												'pmpro_restricted_file_dir' => 'logs',
@@ -205,16 +331,24 @@ function pmprobrevo_settings_page() {
 				</div>
 				<div class="pmpro_section_inside" style="<?php echo empty( $options['api_key'] ) ? 'display:none;' : ''; ?>">
 					<?php
-					$force_refresh = ! empty( $_GET['pmprobrevo_refresh_lists'] );
-					$lists         = $api->is_connected() ? $api->get_lists( $force_refresh ) : array();
+					$force_refresh = ! empty( $_GET['pmprobrevo_refresh_lists'] ) && ! empty( $_GET['_wpnonce'] ) && wp_verify_nonce( sanitize_key( wp_unslash( $_GET['_wpnonce'] ) ), 'pmprobrevo_refresh_lists' );
+					$lists         = ( $api->is_connected() && ! is_wp_error( $account ) ) ? $api->get_lists( $force_refresh ) : array();
+					$refresh_url   = add_query_arg(
+						array(
+							'pmprobrevo_refresh_lists' => '1',
+							'_wpnonce'                 => wp_create_nonce( 'pmprobrevo_refresh_lists' ),
+						)
+					);
 
 					if ( ! $api->is_connected() ) {
 						echo '<div class="pmpro_message pmpro_error"><p>' . esc_html__( 'Enter your API key above and save to connect to Brevo.', 'pmpro-brevo' ) . '</p></div>';
+					} elseif ( is_wp_error( $account ) ) {
+						echo '<div class="pmpro_message pmpro_error"><p>' . esc_html__( 'Lists will load once the connection to Brevo works. Check the Connection Status above.', 'pmpro-brevo' ) . '</p></div>';
 					} elseif ( empty( $lists ) ) {
 						?>
 						<p>
 							<?php esc_html_e( 'No lists found in your Brevo account.', 'pmpro-brevo' ); ?>
-							<a href="<?php echo esc_url( add_query_arg( 'pmprobrevo_refresh_lists', '1' ) ); ?>">
+							<a href="<?php echo esc_url( $refresh_url ); ?>">
 								<?php esc_html_e( 'Click here to refresh lists', 'pmpro-brevo' ); ?>
 							</a>
 						</p>
@@ -223,7 +357,7 @@ function pmprobrevo_settings_page() {
 						?>
 						<p>
 							<?php echo esc_html__( 'Select the Brevo lists to add members to when they are added to each membership level.', 'pmpro-brevo' ) . ' '; ?>
-							<a href="<?php echo esc_url( add_query_arg( 'pmprobrevo_refresh_lists', '1' ) ); ?>">
+							<a href="<?php echo esc_url( $refresh_url ); ?>">
 								<?php esc_html_e( 'Click here to refresh lists', 'pmpro-brevo' ); ?>
 							</a>
 						</p>
@@ -262,6 +396,33 @@ function pmprobrevo_settings_page() {
 								</tr>
 								<?php
 							}
+							if ( ! empty( $options['retired_lists'] ) ) {
+								$list_names = array();
+								foreach ( $lists as $list ) {
+									$list_names[ (int) $list['id'] ] = $list['name'];
+								}
+								$retired_names = array();
+								foreach ( $options['retired_lists'] as $retired_list_id ) {
+									$retired_names[] = isset( $list_names[ (int) $retired_list_id ] ) ? $list_names[ (int) $retired_list_id ] : '#' . (int) $retired_list_id;
+								}
+								?>
+								<tr>
+									<th scope="row"><?php esc_html_e( 'Previously Assigned Lists', 'pmpro-brevo' ); ?></th>
+									<td>
+										<p>
+											<?php
+											// translators: %s: Comma-separated list of Brevo list names.
+											echo esc_html( sprintf( __( 'These lists are no longer assigned to a level: %s. Members are still removed from them when they next sync, so former assignments are cleaned up.', 'pmpro-brevo' ), implode( ', ', $retired_names ) ) );
+											?>
+										</p>
+										<label>
+											<input type="checkbox" name="forget_retired_lists" value="1">
+											<?php esc_html_e( 'Stop removing members from these lists', 'pmpro-brevo' ); ?>
+										</label>
+									</td>
+								</tr>
+								<?php
+							}
 							?>
 						</table>
 						<?php
@@ -275,4 +436,45 @@ function pmprobrevo_settings_page() {
 		</form>
 	</div>
 	<?php
+}
+
+/**
+ * Mask an API key for display, keeping only the last four characters.
+ *
+ * @since TBD
+ *
+ * @param string $api_key API key.
+ * @return string Masked key.
+ */
+function pmprobrevo_mask_api_key( $api_key ) {
+	return str_repeat( '*', 20 ) . substr( $api_key, -4 );
+}
+
+/**
+ * Clear account-specific data after switching to a different Brevo account.
+ *
+ * Brevo list IDs and contact IDs are per-account, so mappings and stored IDs from the old account would point at unrelated lists and contacts.
+ *
+ * @since TBD
+ *
+ * @param array $options Plugin options.
+ * @return array Options without list assignments.
+ */
+function pmprobrevo_reset_account_data( $options ) {
+	foreach ( array_keys( $options ) as $key ) {
+		if ( 0 === strpos( $key, 'level_lists_' ) ) {
+			unset( $options[ $key ] );
+		}
+	}
+	unset( $options['retired_lists'], $options['account_fingerprint'] );
+
+	delete_metadata( 'user', 0, 'pmprobrevo_contact_id', '', true );
+	delete_metadata( 'user', 0, 'pmprobrevo_synced', '', true );
+
+	// Pending removals carry the old account's contact IDs.
+	if ( function_exists( 'as_unschedule_all_actions' ) ) {
+		as_unschedule_all_actions( 'pmprobrevo_remove_deleted_contact' );
+	}
+
+	return $options;
 }

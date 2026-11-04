@@ -19,10 +19,13 @@ defined( 'ABSPATH' ) || exit;
  *
  * @since TBD
  *
- * @return string The log file path.
+ * @return string The log file path, or an empty string if no path is available.
  */
 function pmprobrevo_get_log_file_path() {
-	return apply_filters( 'pmprobrevo_log_file_path', pmpro_get_restricted_file_path( 'logs', 'pmpro-brevo.log' ) );
+	// pmpro_get_restricted_file_path() was added in PMPro 3.5.
+	$log_file_path = function_exists( 'pmpro_get_restricted_file_path' ) ? pmpro_get_restricted_file_path( 'logs', 'pmpro-brevo.log' ) : '';
+
+	return apply_filters( 'pmprobrevo_log_file_path', $log_file_path );
 }
 
 /**
@@ -39,8 +42,12 @@ function pmprobrevo_debug_log( $message ) {
 		return;
 	}
 
+	$logfile = pmprobrevo_get_log_file_path();
+	if ( empty( $logfile ) ) {
+		return;
+	}
+
 	$logstr    = "Logged On: " . date_i18n( "m/d/Y H:i:s" ) . "\n" . $message . "\n-------------\n";
-	$logfile   = pmprobrevo_get_log_file_path();
 	$loghandle = fopen( $logfile, "a+" ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 	if ( $loghandle ) {
 		fwrite( $loghandle, $logstr ); // phpcs:ignore WordPress.WP.AlternativeFunctions
@@ -49,8 +56,22 @@ function pmprobrevo_debug_log( $message ) {
 }
 
 // ------------------------------------------------------------------
-// Sync: Enqueue for User
+// Sync: Enqueue and Retry
 // ------------------------------------------------------------------
+
+/**
+ * Check whether background processing is available and enabled.
+ *
+ * @since TBD
+ *
+ * @return bool
+ */
+function pmprobrevo_use_async() {
+	$options      = get_option( 'pmprobrevo_options', array() );
+	$enable_async = isset( $options['enable_async'] ) ? $options['enable_async'] : 'yes';
+
+	return 'no' !== $enable_async && class_exists( 'PMPro_Action_Scheduler' );
+}
 
 /**
  * Enqueue a sync for a user, either via Action Scheduler or immediately.
@@ -61,24 +82,96 @@ function pmprobrevo_debug_log( $message ) {
  * @param bool $update_lists Whether to sync list memberships.
  */
 function pmprobrevo_enqueue_sync_for_user( $user_id, $update_lists = true ) {
-	$options      = get_option( 'pmprobrevo_options', array() );
-	$enable_async = isset( $options['enable_async'] ) ? $options['enable_async'] : 'yes';
+	$args = array(
+		'user_id'      => $user_id,
+		'update_lists' => $update_lists,
+	);
 
-	if ( 'no' === $enable_async || ! class_exists( 'PMPro_Action_Scheduler' ) ) {
-		pmprobrevo_sync_contact_for_user( $user_id, $update_lists );
+	if ( ! pmprobrevo_use_async() ) {
+		$result = pmprobrevo_sync_contact_for_user( $user_id, $update_lists );
+		pmprobrevo_handle_task_result( $result, 'pmprobrevo_sync_contact_for_user', $args, 0, false );
 		return;
 	}
 
-	PMPro_Action_Scheduler::instance()->maybe_add_task(
-		'pmprobrevo_sync_contact_for_user',
-		array(
-			'user_id'      => $user_id,
-			'update_lists' => $update_lists,
-		),
-		'pmprobrevo_sync_tasks'
-	);
+	PMPro_Action_Scheduler::instance()->maybe_add_task( 'pmprobrevo_sync_contact_for_user', $args, 'pmprobrevo_sync_tasks' );
 }
-add_action( 'pmprobrevo_sync_contact_for_user', 'pmprobrevo_sync_contact_for_user', 10, 2 );
+
+/**
+ * Run a queued user sync from Action Scheduler.
+ *
+ * @since TBD
+ *
+ * @param int  $user_id      WordPress user ID.
+ * @param bool $update_lists Whether to sync list memberships.
+ * @param int  $attempt      Number of earlier attempts for this sync.
+ * @throws Exception If the sync failed and will not be retried, so Action Scheduler marks the task as failed.
+ */
+function pmprobrevo_run_sync_task( $user_id, $update_lists = true, $attempt = 0 ) {
+	$result = pmprobrevo_sync_contact_for_user( $user_id, $update_lists );
+	$args   = array(
+		'user_id'      => $user_id,
+		'update_lists' => $update_lists,
+	);
+	pmprobrevo_handle_task_result( $result, 'pmprobrevo_sync_contact_for_user', $args, (int) $attempt, true );
+}
+add_action( 'pmprobrevo_sync_contact_for_user', 'pmprobrevo_run_sync_task', 10, 3 );
+
+/**
+ * Retry a failed sync task when the error is temporary.
+ *
+ * Retries use exponential backoff and respect Brevo's rate limit reset time.
+ * When the task is out of retries, a task running in Action Scheduler throws so it is recorded as failed.
+ *
+ * @since TBD
+ *
+ * @param true|WP_Error $result                 Result of the task.
+ * @param string        $hook                   Action Scheduler hook for the task.
+ * @param array         $args                   Task arguments, without the attempt count.
+ * @param int           $attempt                Number of earlier attempts for this task.
+ * @param bool          $in_action_scheduler    Whether the task is running inside Action Scheduler.
+ * @throws Exception If the task failed for good and is running inside Action Scheduler.
+ */
+function pmprobrevo_handle_task_result( $result, $hook, $args, $attempt, $in_action_scheduler ) {
+	if ( ! is_wp_error( $result ) ) {
+		return;
+	}
+
+	/**
+	 * Filter the maximum number of retries for a failed Brevo sync.
+	 *
+	 * @since TBD
+	 *
+	 * @param int $max_retries Maximum number of retries. Default 5.
+	 */
+	$max_retries = (int) apply_filters( 'pmprobrevo_max_sync_retries', 5 );
+
+	if ( PMPro_Brevo_API::is_retryable_error( $result ) && $attempt < $max_retries && class_exists( 'PMPro_Action_Scheduler' ) ) {
+		$error_data  = $result->get_error_data();
+		$retry_after = ( is_array( $error_data ) && ! empty( $error_data['retry_after'] ) ) ? (int) $error_data['retry_after'] : 0;
+		$delay       = max( MINUTE_IN_SECONDS * pow( 2, $attempt ), $retry_after + 5 );
+		$delay       = min( $delay, HOUR_IN_SECONDS );
+
+		$args['attempt'] = $attempt + 1;
+
+		// Returns null when the same retry is already queued, or 0 if scheduling failed.
+		$scheduled = PMPro_Action_Scheduler::instance()->maybe_add_task( $hook, $args, 'pmprobrevo_sync_tasks', time() + $delay );
+		if ( 0 !== $scheduled ) {
+			pmprobrevo_debug_log( "Task {$hook} failed with a temporary error: " . $result->get_error_message() . ". Retry {$args['attempt']} of {$max_retries} scheduled in {$delay} seconds. Args: " . wp_json_encode( $args ) );
+			return;
+		}
+
+		unset( $args['attempt'] );
+		$message = "Task {$hook} failed and its retry could not be scheduled: " . $result->get_error_message() . ". Args: " . wp_json_encode( $args );
+	} else {
+		$message = "Task {$hook} failed and will not be retried: " . $result->get_error_message() . ". Args: " . wp_json_encode( $args );
+	}
+
+	pmprobrevo_debug_log( $message );
+
+	if ( $in_action_scheduler ) {
+		throw new Exception( esc_html( $message ) );
+	}
+}
 
 // ------------------------------------------------------------------
 // Sync: Core Logic
@@ -94,16 +187,17 @@ add_action( 'pmprobrevo_sync_contact_for_user', 'pmprobrevo_sync_contact_for_use
  *
  * @param int  $user_id      WordPress user ID.
  * @param bool $update_lists Whether to sync list memberships.
+ * @return true|WP_Error True on success or when there is nothing to do, WP_Error if a Brevo request failed.
  */
 function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 	$api = PMPro_Brevo_API::get_instance();
 	if ( ! $api->is_connected() ) {
-		return;
+		return true;
 	}
 
 	$user = get_userdata( $user_id );
 	if ( ! $user ) {
-		return;
+		return true;
 	}
 
 	$options = get_option( 'pmprobrevo_options', array() );
@@ -116,12 +210,13 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 	$log  = "Updating contact for user ID {$user_id} (email: {$user->user_email}). ";
 	$log .= "Current level IDs: " . ( ! empty( $level_ids ) ? implode( ', ', $level_ids ) : 'none' ) . ". ";
 
-	// If the user has no membership levels and is not already a contact, bail.
-	$contact_id = get_user_meta( $user_id, 'pmprobrevo_contact_id', true );
-	if ( empty( $level_ids ) && empty( $contact_id ) ) {
-		$log .= "User has no membership levels and is not a contact. No action taken. ";
+	// If the user has no membership levels and has never been synced, bail.
+	$contact_id = (int) get_user_meta( $user_id, 'pmprobrevo_contact_id', true );
+	$synced     = ! empty( $contact_id ) || ! empty( get_user_meta( $user_id, 'pmprobrevo_synced', true ) );
+	if ( empty( $level_ids ) && ! $synced ) {
+		$log .= "User has no membership levels and has never been synced. No action taken. ";
 		pmprobrevo_debug_log( $log );
-		return;
+		return true;
 	}
 
 	// ------------------------------------------------------------------
@@ -175,21 +270,7 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 	$lists_to_remove = array();
 	$unsubscribe     = isset( $options['unsubscribe'] ) ? $options['unsubscribe'] : 'yes';
 	if ( $update_lists && 'yes' === $unsubscribe ) {
-		$controlled_list_ids = pmprobrevo_get_controlled_list_ids();
-
-		/**
-		 * Filter the list IDs that PMPro controls.
-		 *
-		 * Only PMPro-controlled lists are removed when a member loses a level.
-		 * Lists not in this list are preserved even during level changes.
-		 *
-		 * @since TBD
-		 *
-		 * @param array $controlled_list_ids All configured list IDs.
-		 */
-		$controlled_list_ids = apply_filters( 'pmprobrevo_controlled_list_ids', $controlled_list_ids );
-
-		$lists_to_remove = array_values( array_diff( $controlled_list_ids, $subscribe_lists ) );
+		$lists_to_remove = array_values( array_diff( pmprobrevo_get_controlled_list_ids(), $subscribe_lists ) );
 		$log .= "Lists to remove: " . ( ! empty( $lists_to_remove ) ? implode( ', ', $lists_to_remove ) : 'none' ) . ". ";
 	} elseif ( 'no' === $unsubscribe ) {
 		$log .= "List removal is disabled. ";
@@ -200,13 +281,11 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 	// Look the contact up first so a deleted contact (404) falls back to the
 	// email upsert and so we know its current email and blacklist status.
 	// ------------------------------------------------------------------
-	$updated_by_id     = false;
 	$email_blacklisted = null;
 	if ( ! empty( $contact_id ) ) {
 		$existing = $api->get_contact_by_id( $contact_id );
 		if ( is_wp_error( $existing ) ) {
-			$error_data = $existing->get_error_data();
-			if ( ! empty( $error_data['status'] ) && 404 === (int) $error_data['status'] ) {
+			if ( 404 === PMPro_Brevo_API::get_error_status( $existing ) ) {
 				// Contact was deleted in Brevo. Fall back to the email upsert below.
 				$log .= "Contact ID {$contact_id} no longer exists in Brevo. Falling back to upsert by email. ";
 				delete_user_meta( $user_id, 'pmprobrevo_contact_id' );
@@ -214,7 +293,7 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 			} else {
 				$log .= "Could not retrieve contact ID {$contact_id}: " . $existing->get_error_message() . ". ";
 				pmprobrevo_debug_log( $log );
-				return;
+				return $existing;
 			}
 		}
 	}
@@ -239,62 +318,91 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 		}
 
 		$result = $api->update_contact( $contact_id, $update_data );
+
+		// The new email may already belong to another Brevo contact. Sync everything else and keep the old email.
+		if ( isset( $update_data['attributes']['EMAIL'] ) && pmprobrevo_is_identifier_conflict( $result ) ) {
+			$log .= "WARNING: Could not change contact {$contact_id}'s email to {$contact_data['email']}. Brevo reported a possible conflict (" . $result->get_error_message() . "), so another Brevo contact may already use that email. Syncing without the email change. Merge the contacts manually in Brevo if needed. ";
+			unset( $update_data['attributes']['EMAIL'] );
+			$result = $api->update_contact( $contact_id, $update_data );
+		}
+
 		if ( is_wp_error( $result ) ) {
 			$log .= "Error updating contact ID {$contact_id}: " . $result->get_error_message() . ". ";
 			pmprobrevo_debug_log( $log );
-			return;
+			return $result;
 		}
 
-		$updated_by_id = true;
 		$log .= "Updated contact ID {$contact_id} by ID. ";
 		if ( ! empty( $lists_to_remove ) ) {
 			$log .= "Removed list IDs: " . implode( ', ', $lists_to_remove ) . ". ";
 		}
-	}
-
-	// ------------------------------------------------------------------
-	// Otherwise upsert by email.
-	// POST /contacts with updateEnabled is non-destructive — listIds here are ADDED, not replaced.
-	// ------------------------------------------------------------------
-	if ( ! $updated_by_id ) {
+	} elseif ( empty( $level_ids ) ) {
+		// ------------------------------------------------------------------
+		// A former member whose contact ID we don't have.
+		// Remove their lists by email, but don't create a contact for them.
+		// ------------------------------------------------------------------
+		if ( ! empty( $lists_to_remove ) ) {
+			$result = $api->update_contact_by_email( $contact_data['email'], array( 'unlinkListIds' => $lists_to_remove ) );
+			if ( is_wp_error( $result ) ) {
+				if ( 404 === PMPro_Brevo_API::get_error_status( $result ) ) {
+					$log .= "No Brevo contact found for {$contact_data['email']}. Nothing to remove. ";
+					delete_user_meta( $user_id, 'pmprobrevo_synced' );
+					pmprobrevo_debug_log( $log );
+					return true;
+				}
+				$log .= "Error removing lists by email: " . $result->get_error_message() . ". ";
+				pmprobrevo_debug_log( $log );
+				return $result;
+			}
+			$log .= "Removed list IDs by email: " . implode( ', ', $lists_to_remove ) . ". ";
+		} else {
+			$log .= "No contact ID stored and no lists to remove. ";
+		}
+	} else {
+		// ------------------------------------------------------------------
+		// Otherwise upsert by email.
+		// POST /contacts with updateEnabled is non-destructive — listIds here are ADDED, not replaced.
+		// ------------------------------------------------------------------
 		$result = $api->upsert_contact( $contact_data );
 
 		if ( is_wp_error( $result ) ) {
 			$log .= "Error upserting contact: " . $result->get_error_message() . ". ";
 			pmprobrevo_debug_log( $log );
-			return;
+			return $result;
 		}
 
-		// 201 returns the new ID. 204 (updated existing contact) returns nothing, so look the contact up.
+		update_user_meta( $user_id, 'pmprobrevo_synced', 1 );
+
 		if ( ! empty( $result['id'] ) ) {
+			// 201: a brand-new contact, so it isn't on any lists we need to remove.
 			$contact_id = (int) $result['id'];
+			update_user_meta( $user_id, 'pmprobrevo_contact_id', $contact_id );
 			$log .= "Created contact ID {$contact_id}. ";
 		} else {
+			// 204: updated an existing contact, which returns no body, so look the contact up.
 			$contact = $api->get_contact( $contact_data['email'] );
 			if ( is_wp_error( $contact ) ) {
 				$log .= "Updated existing contact but could not retrieve it: " . $contact->get_error_message() . ". ";
 			} else {
 				$contact_id        = ! empty( $contact['id'] ) ? (int) $contact['id'] : 0;
 				$email_blacklisted = ! empty( $contact['emailBlacklisted'] );
+				if ( $contact_id ) {
+					update_user_meta( $user_id, 'pmprobrevo_contact_id', $contact_id );
+				}
 				$log .= "Updated contact ID {$contact_id} (emailBlacklisted: " . ( $email_blacklisted ? 'true' : 'false' ) . "). ";
 			}
-		}
 
-		// Remove lists one call at a time, by email.
-		foreach ( $lists_to_remove as $list_id ) {
-			$response = $api->remove_contact_from_list( $contact_data['email'], $list_id );
-			if ( is_wp_error( $response ) ) {
-				$log .= "Error removing list ID {$list_id}: " . $response->get_error_message() . ". ";
-			} elseif ( ! empty( $response['failure'] ) ) {
-				$log .= "Brevo could not remove the contact from list ID {$list_id} (not in list, or removal failed). ";
-			} else {
-				$log .= "Removed list ID {$list_id}. ";
+			if ( ! empty( $lists_to_remove ) ) {
+				$unlink_data = array( 'unlinkListIds' => $lists_to_remove );
+				$result      = $contact_id ? $api->update_contact( $contact_id, $unlink_data ) : $api->update_contact_by_email( $contact_data['email'], $unlink_data );
+				if ( is_wp_error( $result ) ) {
+					$log .= "Error removing list IDs " . implode( ', ', $lists_to_remove ) . ": " . $result->get_error_message() . ". ";
+					pmprobrevo_debug_log( $log );
+					return $result;
+				}
+				$log .= "Removed list IDs: " . implode( ', ', $lists_to_remove ) . ". ";
 			}
 		}
-	}
-
-	if ( $contact_id ) {
-		update_user_meta( $user_id, 'pmprobrevo_contact_id', $contact_id );
 	}
 
 	// Log a warning for contacts that have unsubscribed from email.
@@ -303,6 +411,103 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 	}
 
 	pmprobrevo_debug_log( $log );
+	return true;
+}
+
+/**
+ * Remove a deleted user's contact from all PMPro-controlled lists.
+ *
+ * Runs from a task that carries the contact ID and email, because the WordPress user no longer exists.
+ *
+ * @since TBD
+ *
+ * @param int    $contact_id Brevo contact ID, or 0 if unknown.
+ * @param string $email      Contact email address.
+ * @return true|WP_Error True on success or when there is nothing to do, WP_Error if the Brevo request failed.
+ */
+function pmprobrevo_remove_contact_from_controlled_lists( $contact_id, $email ) {
+	$api = PMPro_Brevo_API::get_instance();
+	if ( ! $api->is_connected() ) {
+		return true;
+	}
+
+	$lists_to_remove = pmprobrevo_get_controlled_list_ids();
+	if ( empty( $lists_to_remove ) ) {
+		return true;
+	}
+
+	$unlink_data = array( 'unlinkListIds' => $lists_to_remove );
+	$log         = "Removing deleted user's contact (ID: " . ( $contact_id ? $contact_id : 'unknown' ) . ", email: {$email}) from list IDs " . implode( ', ', $lists_to_remove ) . ". ";
+
+	$result = ! empty( $contact_id ) ? $api->update_contact( $contact_id, $unlink_data ) : null;
+	if ( null === $result || ( is_wp_error( $result ) && 404 === PMPro_Brevo_API::get_error_status( $result ) ) ) {
+		// No ID, or the contact was deleted and may have been recreated with the same email.
+		if ( null !== $result ) {
+			$log .= "Contact ID {$contact_id} not found. Trying by email. ";
+		}
+		$result = $api->update_contact_by_email( $email, $unlink_data );
+	}
+
+	if ( is_wp_error( $result ) ) {
+		if ( 404 === PMPro_Brevo_API::get_error_status( $result ) ) {
+			pmprobrevo_debug_log( $log . "Contact not found in Brevo. Nothing to remove." );
+			return true;
+		}
+		pmprobrevo_debug_log( $log . "Error: " . $result->get_error_message() );
+		return $result;
+	}
+
+	pmprobrevo_debug_log( $log . "Done." );
+	return true;
+}
+
+/**
+ * Run a queued deleted-user removal from Action Scheduler.
+ *
+ * @since TBD
+ *
+ * @param int    $contact_id Brevo contact ID, or 0 if unknown.
+ * @param string $email      Contact email address.
+ * @param int    $attempt    Number of earlier attempts for this task.
+ * @throws Exception If the removal failed and will not be retried, so Action Scheduler marks the task as failed.
+ */
+function pmprobrevo_run_remove_deleted_contact_task( $contact_id, $email, $attempt = 0 ) {
+	$result = pmprobrevo_remove_contact_from_controlled_lists( (int) $contact_id, $email );
+	$args   = array(
+		'contact_id' => (int) $contact_id,
+		'email'      => $email,
+	);
+	pmprobrevo_handle_task_result( $result, 'pmprobrevo_remove_deleted_contact', $args, (int) $attempt, true );
+}
+add_action( 'pmprobrevo_remove_deleted_contact', 'pmprobrevo_run_remove_deleted_contact_task', 10, 3 );
+
+/**
+ * Check whether a Brevo error looks like an identifier conflict, such as an email that belongs to another contact.
+ *
+ * Brevo documents a 4xx response for identifier conflicts but not a specific error code,
+ * so this checks for the duplicate_parameter code or a message about an existing or duplicate value.
+ *
+ * @since TBD
+ *
+ * @param array|WP_Error $result Result of an update request.
+ * @return bool
+ */
+function pmprobrevo_is_identifier_conflict( $result ) {
+	if ( ! is_wp_error( $result ) ) {
+		return false;
+	}
+
+	$status = PMPro_Brevo_API::get_error_status( $result );
+	if ( $status < 400 || $status >= 500 || in_array( $status, array( 401, 403, 404, 408, 425, 429 ), true ) ) {
+		return false;
+	}
+
+	$error_data = $result->get_error_data();
+	$response   = ( is_array( $error_data ) && ! empty( $error_data['response'] ) && is_array( $error_data['response'] ) ) ? $error_data['response'] : array();
+	$code       = isset( $response['code'] ) ? (string) $response['code'] : '';
+	$message    = isset( $response['message'] ) ? (string) $response['message'] : '';
+
+	return 'duplicate_parameter' === $code || 1 === preg_match( '/already|exist|duplicate/i', $message );
 }
 
 // ------------------------------------------------------------------
@@ -310,7 +515,10 @@ function pmprobrevo_sync_contact_for_user( $user_id, $update_lists = true ) {
 // ------------------------------------------------------------------
 
 /**
- * Get all list IDs configured across all membership levels.
+ * Get all list IDs that PMPro controls.
+ *
+ * Includes the lists assigned to any membership level, plus lists that were
+ * unassigned from a level since members may still be on them.
  *
  * @since TBD
  *
@@ -321,20 +529,36 @@ function pmprobrevo_get_controlled_list_ids() {
 
 	// Use the pre-computed list saved on settings save when available.
 	if ( ! empty( $options['level_lists_all'] ) ) {
-		return array_values( array_unique( array_map( 'intval', array_filter( $options['level_lists_all'] ) ) ) );
-	}
-
-	// Fallback: compute from per-level keys.
-	$all_lists = array();
-	$levels    = pmpro_getAllLevels( true, true );
-	foreach ( $levels as $level ) {
-		$key = 'level_lists_' . $level->id;
-		if ( ! empty( $options[ $key ] ) ) {
-			$all_lists = array_merge( $all_lists, $options[ $key ] );
+		$all_lists = $options['level_lists_all'];
+	} else {
+		// Fallback: compute from per-level keys.
+		$all_lists = array();
+		$levels    = pmpro_getAllLevels( true, true );
+		foreach ( $levels as $level ) {
+			$key = 'level_lists_' . $level->id;
+			if ( ! empty( $options[ $key ] ) ) {
+				$all_lists = array_merge( $all_lists, $options[ $key ] );
+			}
 		}
 	}
 
-	return array_values( array_unique( array_map( 'intval', array_filter( $all_lists ) ) ) );
+	if ( ! empty( $options['retired_lists'] ) ) {
+		$all_lists = array_merge( $all_lists, $options['retired_lists'] );
+	}
+
+	$controlled_list_ids = array_values( array_unique( array_map( 'intval', array_filter( $all_lists ) ) ) );
+
+	/**
+	 * Filter the list IDs that PMPro controls.
+	 *
+	 * Only PMPro-controlled lists are removed when a member loses a level.
+	 * Lists not in this list are preserved even during level changes.
+	 *
+	 * @since TBD
+	 *
+	 * @param array $controlled_list_ids All configured list IDs.
+	 */
+	return array_values( array_map( 'intval', (array) apply_filters( 'pmprobrevo_controlled_list_ids', $controlled_list_ids ) ) );
 }
 
 // ------------------------------------------------------------------
@@ -421,3 +645,48 @@ function pmprobrevo_sync_user_on_edit_member_user_fields_save() {
 	pmprobrevo_enqueue_sync_for_user( $user_id, 'contact_only' !== $update_on_profile_save );
 }
 add_action( 'admin_init', 'pmprobrevo_sync_user_on_edit_member_user_fields_save', 20 );
+
+/**
+ * When a WordPress user is deleted, remove their contact from PMPro-controlled lists.
+ *
+ * Runs while the user's meta is still readable. The removal task carries the
+ * contact ID and email because the user will be gone when it runs.
+ *
+ * @since TBD
+ *
+ * @param int $user_id WordPress user ID.
+ */
+function pmprobrevo_remove_lists_on_user_delete( $user_id ) {
+	$api = PMPro_Brevo_API::get_instance();
+	if ( ! $api->is_connected() ) {
+		return;
+	}
+
+	$options     = get_option( 'pmprobrevo_options', array() );
+	$unsubscribe = isset( $options['unsubscribe'] ) ? $options['unsubscribe'] : 'yes';
+	if ( 'yes' !== $unsubscribe ) {
+		return;
+	}
+
+	$user       = get_userdata( $user_id );
+	$contact_id = (int) get_user_meta( $user_id, 'pmprobrevo_contact_id', true );
+	$synced     = ! empty( $contact_id ) || ! empty( get_user_meta( $user_id, 'pmprobrevo_synced', true ) );
+	if ( ! $user || ! $synced ) {
+		return;
+	}
+
+	$args = array(
+		'contact_id' => $contact_id,
+		'email'      => $user->user_email,
+	);
+
+	if ( ! pmprobrevo_use_async() ) {
+		$result = pmprobrevo_remove_contact_from_controlled_lists( $contact_id, $user->user_email );
+		pmprobrevo_handle_task_result( $result, 'pmprobrevo_remove_deleted_contact', $args, 0, false );
+		return;
+	}
+
+	PMPro_Action_Scheduler::instance()->maybe_add_task( 'pmprobrevo_remove_deleted_contact', $args, 'pmprobrevo_sync_tasks' );
+}
+add_action( 'delete_user', 'pmprobrevo_remove_lists_on_user_delete' );
+add_action( 'wpmu_delete_user', 'pmprobrevo_remove_lists_on_user_delete' );
